@@ -52,6 +52,7 @@ check-merge-conflict:
   cache:                           {}
   <<:                              *kubernetes-build
   only:
+    - branches
     - /^[0-9]+$/
   variables:
     GITHUB_API:                    "https://api.github.com"
@@ -77,6 +78,7 @@ test-linux-stable:                 &test
     - master
     - schedules
     - web
+    - branches
     - /^[0-9]+$/
   except:
     variables:
