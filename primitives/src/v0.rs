@@ -18,8 +18,6 @@
 //! perspective.
 
 use sp_std::prelude::*;
-#[cfg(feature = "std")]
-use sp_std::convert::TryInto;
 use sp_std::cmp::Ordering;
 
 use parity_scale_codec::{Encode, Decode};
@@ -29,13 +27,9 @@ use serde::{Serialize, Deserialize};
 #[cfg(feature = "std")]
 use parity_util_mem::{MallocSizeOf, MallocSizeOfOps};
 
-#[cfg(feature = "std")]
-use sp_keystore::{CryptoStore, SyncCryptoStorePtr, Error as KeystoreError};
 use primitives::RuntimeDebug;
 use runtime_primitives::traits::{AppVerify, Block as BlockT};
 use inherents::InherentIdentifier;
-#[cfg(feature = "std")]
-use application_crypto::AppKey;
 use application_crypto::KeyTypeId;
 
 pub use runtime_primitives::traits::{BlakeTwo256, Hash as HashT, Verify, IdentifyAccount};
@@ -114,7 +108,16 @@ impl MallocSizeOf for ValidatorId {
 }
 
 /// Index of the validator is used as a lightweight replacement of the `ValidatorId` when appropriate.
-pub type ValidatorIndex = u32;
+#[derive(Eq, Ord, PartialEq, PartialOrd, Copy, Clone, Encode, Decode)]
+#[cfg_attr(feature = "std", derive(Serialize, Deserialize, Debug, Hash, MallocSizeOf))]
+pub struct ValidatorIndex(pub u32);
+
+// We should really get https://github.com/paritytech/polkadot/issues/2403 going ..
+impl From<u32> for ValidatorIndex {
+	fn from(n: u32) -> Self {
+		ValidatorIndex(n)
+	}
+}
 
 application_crypto::with_pair! {
 	/// A Parachain validator keypair.
@@ -181,7 +184,7 @@ pub const PARACHAIN_INFO: Info = Info {
 	scheduling: Scheduling::Always,
 };
 
-/// Auxilliary for when there's an attempt to swap two parachains/parathreads.
+/// Auxiliary for when there's an attempt to swap two parachains/parathreads.
 pub trait SwapAux {
 	/// Result describing whether it is possible to swap two parachains. Doesn't mutate state.
 	fn ensure_can_swap(one: Id, other: Id) -> Result<(), &'static str>;
@@ -424,7 +427,7 @@ pub struct AbridgedCandidateReceipt<H = Hash> {
 	pub collator: CollatorId,
 	/// Signature on blake2-256 of the block data by collator.
 	pub signature: CollatorSignature,
-	/// The hash of the pov-block.
+	/// The hash of the `pov-block`.
 	pub pov_block_hash: H,
 	/// Commitments made as a result of validation.
 	pub commitments: CandidateCommitments<H>,
@@ -432,7 +435,7 @@ pub struct AbridgedCandidateReceipt<H = Hash> {
 
 /// A candidate-receipt with commitments directly included.
 pub struct CommitedCandidateReceipt<H = Hash> {
-	/// The descriptor of the candidae.
+	/// The descriptor of the candidate.
 	pub descriptor: CandidateDescriptor,
 
 	/// The commitments of the candidate receipt.
@@ -558,9 +561,9 @@ pub struct CandidateDescriptor<H = Hash> {
 	/// The collator's relay-chain account ID
 	pub collator: CollatorId,
 	/// Signature on blake2-256 of components of this receipt:
-	/// The para ID, the relay parent, and the pov_hash.
+	/// The para ID, the relay parent, and the `pov_hash`.
 	pub signature: CollatorSignature,
-	/// The hash of the pov-block.
+	/// The hash of the `pov-block`.
 	pub pov_hash: H,
 }
 
@@ -579,12 +582,12 @@ pub struct CollationInfo {
 	pub signature: CollatorSignature,
 	/// The head-data
 	pub head_data: HeadData,
-	/// blake2-256 Hash of the pov-block
+	/// blake2-256 Hash of the `pov-block`
 	pub pov_block_hash: Hash,
 }
 
 impl CollationInfo {
-	/// Check integrity vs. a pov-block.
+	/// Check integrity vs. a `pov-block`.
 	pub fn check_signature(&self) -> Result<(), ()> {
 		check_collator_signature(
 			&self.relay_parent,
@@ -656,48 +659,79 @@ pub struct AvailableData {
 	// In the future, outgoing messages as well.
 }
 
-/// A chunk of erasure-encoded block data.
-#[derive(PartialEq, Eq, Clone, Encode, Decode, Default)]
-#[cfg_attr(feature = "std", derive(Serialize, Deserialize, Debug, Hash))]
-pub struct ErasureChunk {
-	/// The erasure-encoded chunk of data belonging to the candidate block.
-	pub chunk: Vec<u8>,
-	/// The index of this erasure-encoded chunk of data.
-	pub index: u32,
-	/// Proof for this chunk's branch in the Merkle tree.
-	pub proof: Vec<Vec<u8>>,
-}
+const BACKING_STATEMENT_MAGIC: [u8; 4] = *b"BKNG";
 
 /// Statements that can be made about parachain candidates. These are the
 /// actual values that are signed.
-#[derive(Clone, PartialEq, Eq, Encode, Decode)]
+#[derive(Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "std", derive(Debug, Hash))]
 pub enum CompactStatement {
 	/// Proposal of a parachain candidate.
-	#[codec(index = 1)]
-	Candidate(CandidateHash),
+	Seconded(CandidateHash),
 	/// State that a parachain candidate is valid.
+	Valid(CandidateHash),
+}
+
+impl CompactStatement {
+	/// Yields the payload used for validator signatures on this kind
+	/// of statement.
+	pub fn signing_payload(&self, context: &SigningContext) -> Vec<u8> {
+		(self, context).encode()
+	}
+}
+
+// Inner helper for codec on `CompactStatement`.
+#[derive(Encode, Decode)]
+enum CompactStatementInner {
+	#[codec(index = 1)]
+	Seconded(CandidateHash),
 	#[codec(index = 2)]
 	Valid(CandidateHash),
-	/// State that a parachain candidate is invalid.
-	#[codec(index = 3)]
-	Invalid(CandidateHash),
+}
+
+impl From<CompactStatement> for CompactStatementInner {
+	fn from(s: CompactStatement) -> Self {
+		match s {
+			CompactStatement::Seconded(h) => CompactStatementInner::Seconded(h),
+			CompactStatement::Valid(h) => CompactStatementInner::Valid(h),
+		}
+	}
+}
+
+impl parity_scale_codec::Encode for CompactStatement {
+	fn size_hint(&self) -> usize {
+		// magic + discriminant + payload
+		4 + 1 + 32
+	}
+
+	fn encode_to<T: parity_scale_codec::Output + ?Sized>(&self, dest: &mut T) {
+		dest.write(&BACKING_STATEMENT_MAGIC);
+		CompactStatementInner::from(self.clone()).encode_to(dest)
+	}
+}
+
+impl parity_scale_codec::Decode for CompactStatement {
+	fn decode<I: parity_scale_codec::Input>(input: &mut I) -> Result<Self, parity_scale_codec::Error> {
+		let maybe_magic = <[u8; 4]>::decode(input)?;
+		if maybe_magic != BACKING_STATEMENT_MAGIC {
+			return Err(parity_scale_codec::Error::from("invalid magic string"));
+		}
+
+		Ok(match CompactStatementInner::decode(input)? {
+			CompactStatementInner::Seconded(h) => CompactStatement::Seconded(h),
+			CompactStatementInner::Valid(h) => CompactStatement::Valid(h),
+		})
+	}
 }
 
 impl CompactStatement {
 	/// Get the underlying candidate hash this references.
 	pub fn candidate_hash(&self) -> &CandidateHash {
 		match *self {
-			CompactStatement::Candidate(ref h)
-				| CompactStatement::Valid(ref h)
-				| CompactStatement::Invalid(ref h)
-				=> h
+			CompactStatement::Seconded(ref h) | CompactStatement::Valid(ref h) => h,
 		}
 	}
 }
-
-/// A signed compact statement, suitable to be sent to the chain.
-pub type SignedStatement = Signed<CompactStatement>;
 
 /// An either implicit or explicit attestation to the validity of a parachain
 /// candidate.
@@ -731,7 +765,7 @@ impl ValidityAttestation {
 	) -> Vec<u8> {
 		match *self {
 			ValidityAttestation::Implicit(_) => (
-				CompactStatement::Candidate(candidate_hash),
+				CompactStatement::Seconded(candidate_hash),
 				signing_context,
 			).encode(),
 			ValidityAttestation::Explicit(_) => (
@@ -829,150 +863,6 @@ pub mod id {
 
 	/// Parachain host runtime API id.
 	pub const PARACHAIN_HOST: ApiId = *b"parahost";
-}
-
-/// This helper trait ensures that we can encode Statement as CompactStatement,
-/// and anything as itself.
-///
-/// This resembles `parity_scale_codec::EncodeLike`, but it's distinct:
-/// EncodeLike is a marker trait which asserts at the typesystem level that
-/// one type's encoding is a valid encoding for another type. It doesn't
-/// perform any type conversion when encoding.
-///
-/// This trait, on the other hand, provides a method which can be used to
-/// simultaneously convert and encode one type as another.
-pub trait EncodeAs<T> {
-	/// Convert Self into T, then encode T.
-	///
-	/// This is useful when T is a subset of Self, reducing encoding costs;
-	/// its signature also means that we do not need to clone Self in order
-	/// to retain ownership, as we would if we were to do
-	/// `self.clone().into().encode()`.
-	fn encode_as(&self) -> Vec<u8>;
-}
-
-impl<T: Encode> EncodeAs<T> for T {
-	fn encode_as(&self) -> Vec<u8> {
-		self.encode()
-	}
-}
-
-/// A signed type which encapsulates the common desire to sign some data and validate a signature.
-///
-/// Note that the internal fields are not public; they are all accessable by immutable getters.
-/// This reduces the chance that they are accidentally mutated, invalidating the signature.
-#[derive(Clone, PartialEq, Eq, Encode, Decode, RuntimeDebug)]
-pub struct Signed<Payload, RealPayload = Payload> {
-	/// The payload is part of the signed data. The rest is the signing context,
-	/// which is known both at signing and at validation.
-	payload: Payload,
-	/// The index of the validator signing this statement.
-	validator_index: ValidatorIndex,
-	/// The signature by the validator of the signed payload.
-	signature: ValidatorSignature,
-	/// This ensures the real payload is tracked at the typesystem level.
-	real_payload: sp_std::marker::PhantomData<RealPayload>,
-}
-
-// We can't bound this on `Payload: Into<RealPayload>` beacuse that conversion consumes
-// the payload, and we don't want that. We can't bound it on `Payload: AsRef<RealPayload>`
-// because there's no blanket impl of `AsRef<T> for T`. In the end, we just invent our
-// own trait which does what we need: EncodeAs.
-impl<Payload: EncodeAs<RealPayload>, RealPayload: Encode> Signed<Payload, RealPayload> {
-	fn payload_data<H: Encode>(payload: &Payload, context: &SigningContext<H>) -> Vec<u8> {
-		// equivalent to (real_payload, context).encode()
-		let mut out = payload.encode_as();
-		out.extend(context.encode());
-		out
-	}
-
-	/// Used to create a `Signed` from already existing parts.
-	#[cfg(feature = "std")]
-	pub fn new<H: Encode>(
-		payload: Payload,
-		validator_index: ValidatorIndex,
-		signature: ValidatorSignature,
-		context: &SigningContext<H>,
-		key: &ValidatorId,
-	) -> Option<Self> {
-		let s = Self {
-			payload,
-			validator_index,
-			signature,
-			real_payload: std::marker::PhantomData,
-		};
-
-		s.check_signature(context, key).ok()?;
-
-		Some(s)
-	}
-
-	/// Sign this payload with the given context and key, storing the validator index.
-	#[cfg(feature = "std")]
-	pub async fn sign<H: Encode>(
-		keystore: &SyncCryptoStorePtr,
-		payload: Payload,
-		context: &SigningContext<H>,
-		validator_index: ValidatorIndex,
-		key: &ValidatorId,
-	) -> Result<Self, KeystoreError> {
-		let data = Self::payload_data(&payload, context);
-		let signature: ValidatorSignature = CryptoStore::sign_with(
-			&**keystore,
-			ValidatorId::ID,
-			&key.into(),
-			&data,
-		).await?.try_into().map_err(|_| KeystoreError::KeyNotSupported(ValidatorId::ID))?;
-		Ok(Self {
-			payload,
-			validator_index,
-			signature,
-			real_payload: std::marker::PhantomData,
-		})
-	}
-
-	/// Validate the payload given the context and public key.
-	pub fn check_signature<H: Encode>(&self, context: &SigningContext<H>, key: &ValidatorId) -> Result<(), ()> {
-		let data = Self::payload_data(&self.payload, context);
-		if self.signature.verify(data.as_slice(), key) { Ok(()) } else { Err(()) }
-	}
-
-	/// Immutably access the payload.
-	#[inline]
-	pub fn payload(&self) -> &Payload {
-		&self.payload
-	}
-
-	/// Immutably access the validator index.
-	#[inline]
-	pub fn validator_index(&self) -> ValidatorIndex {
-		self.validator_index
-	}
-
-	/// Immutably access the signature.
-	#[inline]
-	pub fn signature(&self) -> &ValidatorSignature {
-		&self.signature
-	}
-
-	/// Discard signing data, get the payload
-	// Note: can't `impl<P, R> From<Signed<P, R>> for P` because the orphan rule exception doesn't
-	// handle this case yet. Likewise can't `impl<P, R> Into<P> for Signed<P, R>` because it might
-	// potentially conflict with the global blanket impl, even though it currently doesn't.
-	#[inline]
-	pub fn into_payload(self) -> Payload {
-		self.payload
-	}
-
-	/// Convert `Payload` into `RealPayload`.
-	pub fn convert_payload(&self) -> Signed<RealPayload> where for<'a> &'a Payload: Into<RealPayload> {
-		Signed {
-			signature: self.signature.clone(),
-			validator_index: self.validator_index,
-			payload: self.payload().into(),
-			real_payload: sp_std::marker::PhantomData,
-		}
-	}
 }
 
 /// Custom validity errors used in Polkadot while validating transactions.

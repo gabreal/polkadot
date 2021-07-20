@@ -74,6 +74,14 @@ pub struct GrandpaDeps<B> {
 	pub finality_provider: Arc<FinalityProofProvider<B, Block>>,
 }
 
+/// Dependencies for BEEFY
+pub struct BeefyDeps {
+	/// Receives notifications about signed commitment events from BEEFY.
+	pub beefy_commitment_stream: beefy_gadget::notification::BeefySignedCommitmentStream<Block>,
+	/// Executor to drive the subscription manager in the BEEFY RPC handler.
+	pub subscription_executor: sc_rpc::SubscriptionTaskExecutor,
+}
+
 /// Full client dependencies
 pub struct FullDeps<C, P, SC, B> {
 	/// The client instance to use.
@@ -90,6 +98,8 @@ pub struct FullDeps<C, P, SC, B> {
 	pub babe: BabeDeps,
 	/// GRANDPA specific dependencies.
 	pub grandpa: GrandpaDeps<B>,
+	/// BEEFY specific dependencies.
+	pub beefy: BeefyDeps,
 }
 
 /// Instantiate all RPC extensions.
@@ -97,6 +107,7 @@ pub fn create_full<C, P, SC, B>(deps: FullDeps<C, P, SC, B>) -> RpcExtension whe
 	C: ProvideRuntimeApi<Block> + HeaderBackend<Block> + AuxStore +
 		HeaderMetadata<Block, Error=BlockChainError> + Send + Sync + 'static,
 	C::Api: frame_rpc_system::AccountNonceApi<Block, AccountId, Nonce>,
+	C::Api: pallet_mmr_rpc::MmrRuntimeApi<Block, <Block as sp_runtime::traits::Block>::Hash>,
 	C::Api: pallet_transaction_payment_rpc::TransactionPaymentRuntimeApi<Block, Balance>,
 	C::Api: BabeApi<Block>,
 	C::Api: BlockBuilder<Block>,
@@ -106,9 +117,10 @@ pub fn create_full<C, P, SC, B>(deps: FullDeps<C, P, SC, B>) -> RpcExtension whe
 	B::State: sc_client_api::StateBackend<sp_runtime::traits::HashFor<Block>>,
 {
 	use frame_rpc_system::{FullSystem, SystemApi};
+	use pallet_mmr_rpc::{MmrApi, Mmr};
 	use pallet_transaction_payment_rpc::{TransactionPayment, TransactionPaymentApi};
-	use sc_finality_grandpa_rpc::{GrandpaApi, GrandpaRpcHandler};
 	use sc_consensus_babe_rpc::BabeRpcHandler;
+	use sc_finality_grandpa_rpc::{GrandpaApi, GrandpaRpcHandler};
 
 	let mut io = jsonrpc_core::IoHandler::default();
 	let FullDeps {
@@ -119,6 +131,7 @@ pub fn create_full<C, P, SC, B>(deps: FullDeps<C, P, SC, B>) -> RpcExtension whe
 		deny_unsafe,
 		babe,
 		grandpa,
+		beefy,
 	} = deps;
 	let BabeDeps {
 		keystore,
@@ -138,6 +151,9 @@ pub fn create_full<C, P, SC, B>(deps: FullDeps<C, P, SC, B>) -> RpcExtension whe
 	);
 	io.extend_with(
 		TransactionPaymentApi::to_delegate(TransactionPayment::new(client.clone()))
+	);
+	io.extend_with(
+		MmrApi::to_delegate(Mmr::new(client.clone()))
 	);
 	io.extend_with(
 		sc_consensus_babe_rpc::BabeApi::to_delegate(
@@ -169,6 +185,14 @@ pub fn create_full<C, P, SC, B>(deps: FullDeps<C, P, SC, B>) -> RpcExtension whe
 			deny_unsafe,
 		))
 	);
+
+	io.extend_with(beefy_gadget_rpc::BeefyApi::to_delegate(
+		beefy_gadget_rpc::BeefyRpcHandler::new(
+			beefy.beefy_commitment_stream,
+			beefy.subscription_executor,
+		),
+	));
+
 	io
 }
 

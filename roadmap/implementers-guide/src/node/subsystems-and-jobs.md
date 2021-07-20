@@ -257,24 +257,18 @@ with implementing a gossip protocol:
 sequenceDiagram
     participant SD as StatementDistribution
     participant NB as NetworkBridge
-    participant Listener
 
     alt On receipt of a<br/>SignedStatement from CandidateBacking
         % fn circulate_statement_and_dependents
         SD ->> NB: SendValidationMessage
 
         Note right of NB: Bridge sends validation message to all appropriate peers
-    else On initialization, from other subsystems:
-        Listener ->> SD: RegisterStatementListener
     else On receipt of peer validation message
         NB ->> SD: NetworkBridgeUpdateV1
 
         % fn handle_incoming_message
         alt if we aren't already aware of the relay parent for this statement
             SD ->> NB: ReportPeer
-        else the statement corresponds to our View
-            Note over SD,Listener: Forward the statement to each registered listener
-            SD ->> Listener: SignedFullStatement
         end
 
         % fn circulate_statement
@@ -386,12 +380,9 @@ sequenceDiagram
     participant CB as CandidateBacking
     participant BD as BitfieldDistribution
     participant RA as RuntimeApi
-    participant PO as Proposer
+    participant PI as ParachainsInherentDataProvider
 
-    alt receive request to forward block authorship data
-        A ->> PV: RequestBlockAuthorshipData
-        Note over A,PV: This request contains a mpsc::Sender, which the Provisioner keeps
-    else receive provisionable data
+    alt receive provisionable data
         alt
             CB ->> PV: ProvisionableData
         else
@@ -404,34 +395,24 @@ sequenceDiagram
 
         Note over PV: store bitfields and backed candidates
     else receive request for inherent data
-        PO ->> PV: RequestInherentData
+        PI ->> PV: RequestInherentData
         alt we have already constructed the inherent data
-            PV ->> PO: send the inherent data
+            PV ->> PI: send the inherent data
         else we have not yet constructed the inherent data
-            Note over PV,PO: Store the return sender without sending immediately
+            Note over PV,PI: Store the return sender without sending immediately
         end
     else timer times out
         note over PV: Waited 2 seconds
         PV -->> RA: RuntimeApiRequest::AvailabilityCores
         Note over PV: construct and store the inherent data
         loop over stored inherent data requests
-            PV ->> PO: (SignedAvailabilityBitfields, BackedCandidates)
+            PV ->> PI: (SignedAvailabilityBitfields, BackedCandidates)
         end
     end
 ```
 
 In principle, any arbitrary subsystem could send a `RequestInherentData` to the `Provisioner`. In practice,
-only the `Proposer` does so. Likewise, any arbitrary subsystem could send a `RequestBlockAuthorshipData`; the
-distinction is that no subsystem currently does so.
+only the `ParachainsInherentDataProvider` does so.
 
-The proposer is an atypical subsystem in that, unlike most of them, it is not primarily driven by
-the `Overseer`, but instead by the `sp_consensus::Environment` and `sp_consensus::Proposer` traits
-from Substrate. It doesn't make much sense to diagram this flow because it's very linear:
-
-- Substrate creates a `Proposer` from the `ProposerFactory` once per upcoming block, using the `parent_header: Header`.
-- At some later point, it calls `Proposer::propose(self, ...)`, consuming the proposer to generate a proposal
-- `Proposer::propose` sends a `RequestInherentData` to the `Provisioner`. This has a fixed timeout of
-  2.5 seconds, meaning that the provisioner has approximately 0.5 seconds to generate and send the data.
-
-The tuple `(SignedAvailabilityBitfields, BackedCandidates, ParentHeader)` is injected by the `Proposer`
+The tuple `(SignedAvailabilityBitfields, BackedCandidates, ParentHeader)` is injected by the `ParachainsInherentDataProvider`
 into the inherent data. From that point on, control passes from the node to the runtime.

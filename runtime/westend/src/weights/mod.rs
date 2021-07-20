@@ -17,6 +17,7 @@
 
 pub mod frame_system;
 pub mod pallet_balances;
+pub mod pallet_election_provider_multi_phase;
 pub mod pallet_identity;
 pub mod pallet_im_online;
 pub mod pallet_indices;
@@ -28,3 +29,7 @@ pub mod pallet_staking;
 pub mod pallet_timestamp;
 pub mod pallet_utility;
 pub mod pallet_vesting;
+pub mod runtime_common_auctions;
+pub mod runtime_common_crowdloan;
+pub mod runtime_common_paras_registrar;
+pub mod runtime_common_slots;

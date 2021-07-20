@@ -19,7 +19,7 @@
 //! Configuration can change only at session boundaries and is buffered until then.
 
 use sp_std::prelude::*;
-use primitives::v1::{Balance, ValidatorId, SessionIndex};
+use primitives::v1::{Balance, SessionIndex, MAX_CODE_SIZE, MAX_POV_SIZE};
 use frame_support::{
 	decl_storage, decl_module, decl_error,
 	ensure,
@@ -29,6 +29,7 @@ use frame_support::{
 use parity_scale_codec::{Encode, Decode};
 use frame_system::ensure_root;
 use sp_runtime::traits::Zero;
+use crate::shared;
 
 /// All configuration of the runtime with respect to parachains and parathreads.
 #[derive(Clone, Encode, Decode, PartialEq, sp_core::RuntimeDebug)]
@@ -89,7 +90,7 @@ pub struct HostConfiguration<BlockNumber> {
 	/// stage.
 	///
 	/// NOTE that this is a soft limit and could be exceeded.
-	pub preferred_dispatchable_upward_messages_step_weight: Weight,
+	pub ump_service_total_weight: Weight,
 	/// The maximum number of outbound HRMP channels a parachain is allowed to open.
 	pub hrmp_max_parachain_outbound_channels: u32,
 	/// The maximum number of outbound HRMP channels a parathread is allowed to open.
@@ -117,9 +118,9 @@ pub struct HostConfiguration<BlockNumber> {
 	 * Parameters that will unlikely be needed by parachains.
 	 */
 
-	/// The acceptance period, in blocks. This is the amount of blocks after availability that validators
-	/// and fishermen have to perform secondary checks or issue reports.
-	pub acceptance_period: BlockNumber,
+	/// How long to keep code on-chain, in blocks. This should be sufficiently long that disputes
+	/// have concluded.
+	pub code_retention_period: BlockNumber,
 	/// The amount of execution cores to dedicate to parathread execution.
 	pub parathread_cores: u32,
 	/// The number of retries that a parathread author has to submit their block.
@@ -145,8 +146,18 @@ pub struct HostConfiguration<BlockNumber> {
 	///
 	/// `None` means no maximum.
 	pub max_validators_per_core: Option<u32>,
+	/// The maximum number of validators to use for parachain consensus, period.
+	///
+	/// `None` means no maximum.
+	pub max_validators: Option<u32>,
 	/// The amount of sessions to keep for disputes.
 	pub dispute_period: SessionIndex,
+	/// How long after dispute conclusion to accept statements.
+	pub dispute_post_conclusion_acceptance_period: BlockNumber,
+	/// The maximum number of dispute spam slots
+	pub dispute_max_spam_slots: u32,
+	/// How long it takes for a dispute to conclude by time-out, if no supermajority is reached.
+	pub dispute_conclusion_by_time_out_period: BlockNumber,
 	/// The amount of consensus slots that must pass between submitting an assignment and
 	/// submitting an approval vote before a validator is considered a no-show.
 	///
@@ -159,7 +170,7 @@ pub struct HostConfiguration<BlockNumber> {
 	pub zeroth_delay_tranche_width: u32,
 	/// The number of validators needed to approve a block.
 	pub needed_approvals: u32,
-	/// The number of samples to do of the RelayVRFModulo approval assignment criterion.
+	/// The number of samples to do of the `RelayVRFModulo` approval assignment criterion.
 	pub relay_vrf_modulo_samples: u32,
 }
 
@@ -172,7 +183,7 @@ impl<BlockNumber: Default + From<u32>> Default for HostConfiguration<BlockNumber
 			no_show_slots: 1u32.into(),
 			validation_upgrade_frequency: Default::default(),
 			validation_upgrade_delay: Default::default(),
-			acceptance_period: Default::default(),
+			code_retention_period: Default::default(),
 			max_code_size: Default::default(),
 			max_pov_size: Default::default(),
 			max_head_data_size: Default::default(),
@@ -180,7 +191,11 @@ impl<BlockNumber: Default + From<u32>> Default for HostConfiguration<BlockNumber
 			parathread_retries: Default::default(),
 			scheduling_lookahead: Default::default(),
 			max_validators_per_core: Default::default(),
-			dispute_period: Default::default(),
+			max_validators: None,
+			dispute_period: 6,
+			dispute_post_conclusion_acceptance_period: 100.into(),
+			dispute_max_spam_slots: 2,
+			dispute_conclusion_by_time_out_period: 200.into(),
 			n_delay_tranches: Default::default(),
 			zeroth_delay_tranche_width: Default::default(),
 			needed_approvals: Default::default(),
@@ -188,7 +203,7 @@ impl<BlockNumber: Default + From<u32>> Default for HostConfiguration<BlockNumber
 			max_upward_queue_count: Default::default(),
 			max_upward_queue_size: Default::default(),
 			max_downward_message_size: Default::default(),
-			preferred_dispatchable_upward_messages_step_weight: Default::default(),
+			ump_service_total_weight: Default::default(),
 			max_upward_message_size: Default::default(),
 			max_upward_message_num_per_candidate: Default::default(),
 			hrmp_open_request_ttl: Default::default(),
@@ -212,7 +227,7 @@ impl<BlockNumber: Zero> HostConfiguration<BlockNumber> {
 	/// # Panic
 	///
 	/// This function panics if any member is not set properly.
-	fn check_consistency(&self) {
+	pub fn check_consistency(&self) {
 		if self.group_rotation_frequency.is_zero() {
 			panic!("`group_rotation_frequency` must be non-zero!")
 		}
@@ -228,17 +243,29 @@ impl<BlockNumber: Zero> HostConfiguration<BlockNumber> {
 		if self.no_show_slots.is_zero() {
 			panic!("`no_show_slots` must be at least 1!")
 		}
+
+		if self.max_code_size > MAX_CODE_SIZE {
+			panic!(
+				"`max_code_size` ({}) is bigger than allowed by the client ({})",
+				self.max_code_size,
+				MAX_CODE_SIZE,
+			)
+		}
+
+		if self.max_pov_size > MAX_POV_SIZE {
+			panic!("`max_pov_size` is bigger than allowed by the client")
+		}
 	}
 }
 
-pub trait Config: frame_system::Config { }
+pub trait Config: frame_system::Config + shared::Config { }
 
 decl_storage! {
 	trait Store for Module<T: Config> as Configuration {
 		/// The active configuration for the current session.
 		ActiveConfig get(fn config) config(): HostConfiguration<T::BlockNumber>;
 		/// Pending configuration (if any) for the next session.
-		PendingConfig: Option<HostConfiguration<T::BlockNumber>>;
+		PendingConfig: map hasher(twox_64_concat) SessionIndex => Option<HostConfiguration<T::BlockNumber>>;
 	}
 	add_extra_genesis {
 		build(|config: &Self| {
@@ -281,10 +308,10 @@ decl_module! {
 
 		/// Set the acceptance period for an included candidate.
 		#[weight = (1_000, DispatchClass::Operational)]
-		pub fn set_acceptance_period(origin, new: T::BlockNumber) -> DispatchResult {
+		pub fn set_code_retention_period(origin, new: T::BlockNumber) -> DispatchResult {
 			ensure_root(origin)?;
 			Self::update_config_member(|config| {
-				sp_std::mem::replace(&mut config.acceptance_period, new) != new
+				sp_std::mem::replace(&mut config.code_retention_period, new) != new
 			});
 			Ok(())
 		}
@@ -293,6 +320,7 @@ decl_module! {
 		#[weight = (1_000, DispatchClass::Operational)]
 		pub fn set_max_code_size(origin, new: u32) -> DispatchResult {
 			ensure_root(origin)?;
+			ensure!(new <= MAX_CODE_SIZE, Error::<T>::InvalidNewValue);
 			Self::update_config_member(|config| {
 				sp_std::mem::replace(&mut config.max_code_size, new) != new
 			});
@@ -303,6 +331,7 @@ decl_module! {
 		#[weight = (1_000, DispatchClass::Operational)]
 		pub fn set_max_pov_size(origin, new: u32) -> DispatchResult {
 			ensure_root(origin)?;
+			ensure!(new <= MAX_POV_SIZE, Error::<T>::InvalidNewValue);
 			Self::update_config_member(|config| {
 				sp_std::mem::replace(&mut config.max_pov_size, new) != new
 			});
@@ -399,12 +428,57 @@ decl_module! {
 			Ok(())
 		}
 
+		/// Set the maximum number of validators to use in parachain consensus.
+		#[weight = (1_000, DispatchClass::Operational)]
+		pub fn set_max_validators(origin, new: Option<u32>) -> DispatchResult {
+			ensure_root(origin)?;
+			Self::update_config_member(|config| {
+				sp_std::mem::replace(&mut config.max_validators, new) != new
+			});
+			Ok(())
+		}
+
 		/// Set the dispute period, in number of sessions to keep for disputes.
 		#[weight = (1_000, DispatchClass::Operational)]
 		pub fn set_dispute_period(origin, new: SessionIndex) -> DispatchResult {
 			ensure_root(origin)?;
 			Self::update_config_member(|config| {
 				sp_std::mem::replace(&mut config.dispute_period, new) != new
+			});
+			Ok(())
+		}
+
+		/// Set the dispute post conclusion acceptance period.
+		#[weight = (1_000, DispatchClass::Operational)]
+		pub fn set_dispute_post_conclusion_acceptance_period(
+			origin,
+			new: T::BlockNumber,
+		) -> DispatchResult {
+			ensure_root(origin)?;
+			Self::update_config_member(|config| {
+				sp_std::mem::replace(&mut config.dispute_post_conclusion_acceptance_period, new) != new
+			});
+			Ok(())
+		}
+
+		/// Set the maximum number of dispute spam slots.
+		#[weight = (1_000, DispatchClass::Operational)]
+		pub fn set_dispute_max_spam_slots(origin, new: u32) -> DispatchResult {
+			ensure_root(origin)?;
+			Self::update_config_member(|config| {
+				sp_std::mem::replace(&mut config.dispute_max_spam_slots, new) != new
+			});
+			Ok(())
+		}
+
+		/// Set the dispute conclusion by time out period.
+		#[weight = (1_000, DispatchClass::Operational)]
+		pub fn set_dispute_conclusion_by_time_out_period(origin, new: T::BlockNumber)
+			-> DispatchResult
+		{
+			ensure_root(origin)?;
+			Self::update_config_member(|config| {
+				sp_std::mem::replace(&mut config.dispute_conclusion_by_time_out_period, new) != new
 			});
 			Ok(())
 		}
@@ -453,7 +527,7 @@ decl_module! {
 			Ok(())
 		}
 
-		/// Set the number of samples to do of the RelayVRFModulo approval assignment criterion.
+		/// Set the number of samples to do of the `RelayVRFModulo` approval assignment criterion.
 		#[weight = (1_000, DispatchClass::Operational)]
 		pub fn set_relay_vrf_modulo_samples(origin, new: u32) -> DispatchResult {
 			ensure_root(origin)?;
@@ -495,10 +569,10 @@ decl_module! {
 
 		/// Sets the soft limit for the phase of dispatching dispatchable upward messages.
 		#[weight = (1_000, DispatchClass::Operational)]
-		pub fn set_preferred_dispatchable_upward_messages_step_weight(origin, new: Weight) -> DispatchResult {
+		pub fn set_ump_service_total_weight(origin, new: Weight) -> DispatchResult {
 			ensure_root(origin)?;
 			Self::update_config_member(|config| {
-				sp_std::mem::replace(&mut config.preferred_dispatchable_upward_messages_step_weight, new) != new
+				sp_std::mem::replace(&mut config.ump_service_total_weight, new) != new
 			});
 			Ok(())
 		}
@@ -646,10 +720,24 @@ impl<T: Config> Module<T> {
 	pub(crate) fn initializer_finalize() { }
 
 	/// Called by the initializer to note that a new session has started.
-	pub(crate) fn initializer_on_new_session(_validators: &[ValidatorId], _queued: &[ValidatorId]) {
-		if let Some(pending) = <Self as Store>::PendingConfig::take() {
+	pub(crate) fn initializer_on_new_session(
+		session_index: &SessionIndex,
+	) {
+		if let Some(pending) = <Self as Store>::PendingConfig::take(session_index) {
 			<Self as Store>::ActiveConfig::set(pending);
 		}
+	}
+
+	/// Return the session index that should be used for any future scheduled changes.
+	fn scheduled_session() -> SessionIndex {
+		shared::Module::<T>::scheduled_session()
+	}
+
+	/// Forcibly set the active config. This should be used with extreme care, and typically
+	/// only when enabling parachains runtime modules for the first time on a chain which has
+	/// been running without them.
+	pub fn force_set_active_config(config: HostConfiguration<T::BlockNumber>) {
+		<Self as Store>::ActiveConfig::set(config);
 	}
 
 	// NOTE: Explicitly tell rustc not to inline this because otherwise heuristics note the incoming
@@ -660,11 +748,12 @@ impl<T: Config> Module<T> {
 	fn update_config_member(
 		updater: impl FnOnce(&mut HostConfiguration<T::BlockNumber>) -> bool,
 	) {
-		let pending = <Self as Store>::PendingConfig::get();
+		let scheduled_session = Self::scheduled_session();
+		let pending = <Self as Store>::PendingConfig::get(scheduled_session);
 		let mut prev = pending.unwrap_or_else(Self::config);
 
 		if updater(&mut prev) {
-			<Self as Store>::PendingConfig::set(Some(prev));
+			<Self as Store>::PendingConfig::insert(scheduled_session, prev);
 		}
 	}
 }
@@ -672,32 +761,32 @@ impl<T: Config> Module<T> {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::mock::{new_test_ext, Initializer, Configuration, Origin};
+	use crate::mock::{new_test_ext, Configuration, Origin};
 
-	use frame_support::traits::{OnFinalize, OnInitialize};
+	use frame_support::assert_ok;
 
 	#[test]
-	fn config_changes_on_session_boundary() {
+	fn config_changes_after_2_session_boundary() {
 		new_test_ext(Default::default()).execute_with(|| {
 			let old_config = Configuration::config();
 			let mut config = old_config.clone();
 			config.validation_upgrade_delay = 100;
-
 			assert!(old_config != config);
 
-			<Configuration as Store>::PendingConfig::set(Some(config.clone()));
-
-			Initializer::on_initialize(1);
+			assert_ok!(Configuration::set_validation_upgrade_delay(Origin::root(), 100));
 
 			assert_eq!(Configuration::config(), old_config);
-			assert_eq!(<Configuration as Store>::PendingConfig::get(), Some(config.clone()));
+			assert_eq!(<Configuration as Store>::PendingConfig::get(1), None);
 
-			Initializer::on_finalize(1);
+			Configuration::initializer_on_new_session(&1);
 
-			Configuration::initializer_on_new_session(&[], &[]);
+			assert_eq!(Configuration::config(), old_config);
+			assert_eq!(<Configuration as Store>::PendingConfig::get(2), Some(config.clone()));
+
+			Configuration::initializer_on_new_session(&2);
 
 			assert_eq!(Configuration::config(), config);
-			assert!(<Configuration as Store>::PendingConfig::get().is_none());
+			assert_eq!(<Configuration as Store>::PendingConfig::get(3), None);
 		})
 	}
 
@@ -707,7 +796,7 @@ mod tests {
 			let new_config = HostConfiguration {
 				validation_upgrade_frequency: 100,
 				validation_upgrade_delay: 10,
-				acceptance_period: 5,
+				code_retention_period: 5,
 				max_code_size: 100_000,
 				max_pov_size: 1024,
 				max_head_data_size: 1_000,
@@ -718,7 +807,11 @@ mod tests {
 				thread_availability_period: 8,
 				scheduling_lookahead: 3,
 				max_validators_per_core: None,
+				max_validators: None,
 				dispute_period: 239,
+				dispute_post_conclusion_acceptance_period: 10,
+				dispute_max_spam_slots: 2,
+				dispute_conclusion_by_time_out_period: 512,
 				no_show_slots: 240,
 				n_delay_tranches: 241,
 				zeroth_delay_tranche_width: 242,
@@ -727,7 +820,7 @@ mod tests {
 				max_upward_queue_count: 1337,
 				max_upward_queue_size: 228,
 				max_downward_message_size: 2048,
-				preferred_dispatchable_upward_messages_step_weight: 20000,
+				ump_service_total_weight: 20000,
 				max_upward_message_size: 448,
 				max_upward_message_num_per_candidate: 5,
 				hrmp_open_request_ttl: 1312,
@@ -743,7 +836,7 @@ mod tests {
 				hrmp_max_message_num_per_candidate: 20,
 			};
 
-			assert!(<Configuration as Store>::PendingConfig::get().is_none());
+			assert!(<Configuration as Store>::PendingConfig::get(shared::SESSION_DELAY).is_none());
 
 			Configuration::set_validation_upgrade_frequency(
 				Origin::root(), new_config.validation_upgrade_frequency,
@@ -751,8 +844,8 @@ mod tests {
 			Configuration::set_validation_upgrade_delay(
 				Origin::root(), new_config.validation_upgrade_delay,
 			).unwrap();
-			Configuration::set_acceptance_period(
-				Origin::root(), new_config.acceptance_period,
+			Configuration::set_code_retention_period(
+				Origin::root(), new_config.code_retention_period,
 			).unwrap();
 			Configuration::set_max_code_size(
 				Origin::root(), new_config.max_code_size,
@@ -784,8 +877,20 @@ mod tests {
 			Configuration::set_max_validators_per_core(
 				Origin::root(), new_config.max_validators_per_core,
 			).unwrap();
+			Configuration::set_max_validators(
+				Origin::root(), new_config.max_validators,
+			).unwrap();
 			Configuration::set_dispute_period(
 				Origin::root(), new_config.dispute_period,
+			).unwrap();
+			Configuration::set_dispute_post_conclusion_acceptance_period(
+				Origin::root(), new_config.dispute_post_conclusion_acceptance_period,
+			).unwrap();
+			Configuration::set_dispute_max_spam_slots(
+				Origin::root(), new_config.dispute_max_spam_slots,
+			).unwrap();
+			Configuration::set_dispute_conclusion_by_time_out_period(
+				Origin::root(), new_config.dispute_conclusion_by_time_out_period,
 			).unwrap();
 			Configuration::set_no_show_slots(
 				Origin::root(), new_config.no_show_slots,
@@ -811,8 +916,8 @@ mod tests {
 			Configuration::set_max_downward_message_size(
 				Origin::root(), new_config.max_downward_message_size,
 			).unwrap();
-			Configuration::set_preferred_dispatchable_upward_messages_step_weight(
-				Origin::root(), new_config.preferred_dispatchable_upward_messages_step_weight,
+			Configuration::set_ump_service_total_weight(
+				Origin::root(), new_config.ump_service_total_weight,
 			).unwrap();
 			Configuration::set_max_upward_message_size(
 				Origin::root(), new_config.max_upward_message_size,
@@ -865,7 +970,7 @@ mod tests {
 				new_config.hrmp_max_message_num_per_candidate,
 			).unwrap();
 
-			assert_eq!(<Configuration as Store>::PendingConfig::get(), Some(new_config));
+			assert_eq!(<Configuration as Store>::PendingConfig::get(shared::SESSION_DELAY), Some(new_config));
 		})
 	}
 
@@ -880,7 +985,7 @@ mod tests {
 	fn setting_config_to_same_as_current_is_noop() {
 		new_test_ext(Default::default()).execute_with(|| {
 			Configuration::set_validation_upgrade_delay(Origin::root(), Default::default()).unwrap();
-			assert!(<Configuration as Store>::PendingConfig::get().is_none())
+			assert!(<Configuration as Store>::PendingConfig::get(shared::SESSION_DELAY).is_none())
 		});
 	}
 

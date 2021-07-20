@@ -33,12 +33,12 @@ pub use polkadot_test_service::{
 pub use polkadot_test_runtime as runtime;
 
 /// Test client executor.
-pub type Executor = client::LocalCallExecutor<FullBackend, sc_executor::NativeExecutor<PolkadotTestExecutor>>;
+pub type Executor = client::LocalCallExecutor<Block, FullBackend, sc_executor::NativeExecutor<PolkadotTestExecutor>>;
 
 /// Test client builder for Polkadot.
 pub type TestClientBuilder = substrate_test_client::TestClientBuilder<Block, Executor, FullBackend, GenesisParameters>;
 
-/// LongestChain type for the test runtime/client.
+/// `LongestChain` type for the test runtime/client.
 pub type LongestChain = sc_consensus::LongestChain<FullBackend, Block>;
 
 /// Parameters of test-client builder with test-runtime.
@@ -94,7 +94,7 @@ mod tests{
 		let block_builder = client.init_polkadot_block_builder();
 		let block = block_builder.build().expect("Finalizes the block").block;
 
-		client.import(BlockOrigin::Own, block).expect("Imports the block");
+		futures::executor::block_on(client.import(BlockOrigin::Own, block)).expect("Imports the block");
 	}
 
 	#[test]
@@ -112,6 +112,6 @@ mod tests{
 
 		let block = block_builder.build().expect("Finalizes the block").block;
 
-		client.import(BlockOrigin::Own, block).expect("Imports the block");
+		futures::executor::block_on(client.import(BlockOrigin::Own, block)).expect("Imports the block");
 	}
 }
